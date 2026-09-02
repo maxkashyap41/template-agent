@@ -77,11 +77,24 @@ def decrypt_secret(ciphertext: str | None) -> str | None:
         keys.append(previous)
 
     last_exc: InvalidToken | None = None
-    for fernet in keys:
+    for idx, fernet in enumerate(keys):
         try:
             return cast(str, fernet.decrypt(ciphertext.encode()).decode())
         except InvalidToken as exc:
+            key_label = "primary" if idx == 0 else "previous"
+            logger.warning(
+                "MCP decrypt attempt %d/%d failed (key=%s)",
+                idx + 1,
+                len(keys),
+                key_label,
+            )
             last_exc = exc
 
-    logger.error("Failed to decrypt MCP secret — key mismatch or corrupt data")
+    has_previous = _get_fernet_previous() is not None
+    logger.error(
+        "Failed to decrypt MCP secret — key mismatch or corrupt data "
+        "(tried %d key(s), PREVIOUS_KEY %s)",
+        len(keys),
+        "set" if has_previous else "NOT set",
+    )
     raise RuntimeError("MCP token decryption failed") from last_exc

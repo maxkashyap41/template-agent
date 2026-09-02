@@ -107,6 +107,11 @@ class _TokenInjectorInterceptor:
             if auth_mode in ("oauth", "dcr"):
                 if not user_id:
                     if _mcp_tool_discovery.get():
+                        logger.warning(
+                            "[%s] no user_id during %s tool discovery — proceeding unauthenticated",
+                            self._mcp_name,
+                            auth_mode,
+                        )
                         access = None
                     else:
                         raise NeedsAuthorization(
@@ -120,6 +125,13 @@ class _TokenInjectorInterceptor:
                         )
                     except NeedsAuthorization:
                         if _mcp_tool_discovery.get():
+                            logger.warning(
+                                "[%s] NeedsAuthorization during %s tool discovery for user=%s "
+                                "— proceeding unauthenticated (will create placeholder)",
+                                self._mcp_name,
+                                auth_mode,
+                                user_id,
+                            )
                             access = None
                         else:
                             raise
@@ -298,6 +310,11 @@ async def _resolve_connection_token(
     try:
         return await get_mcp_credential_resolver().resolve(user_id, name, entry)
     except NeedsAuthorization:
+        logger.warning(
+            "[%s] no usable OAuth token for user=%s during connection token resolution",
+            name,
+            user_id,
+        )
         return None
 
 
@@ -384,6 +401,12 @@ def _create_auth_placeholder_tool(
                 # A leftover refresh token must not skip re-auth after refresh fails.
                 await resolver.resolve(user_id, mcp_name, cfg)
                 invalidate_mcp_tool_cache(user_id)
+                logger.warning(
+                    "[%s] placeholder tool resolved auth for user=%s — "
+                    "tool+graph caches invalidated, rebuild on next request",
+                    mcp_name,
+                    user_id,
+                )
                 return (
                     f"Successfully connected to {mcp_name}. "
                     f"The tools are now available — please ask the user to "
@@ -392,14 +415,20 @@ def _create_auth_placeholder_tool(
             except NeedsAuthorization:
                 raise
             except Exception:
-                pass
+                logger.warning(
+                    "[%s] placeholder tool auth resolve failed for user=%s "
+                    "— falling through to NeedsAuthorization",
+                    mcp_name,
+                    user_id,
+                    exc_info=True,
+                )
 
         raise NeedsAuthorization(
             mcp_name,
             get_mcp_credential_resolver().connect_url(mcp_name),
         )
 
-    return StructuredTool(
+    tool = StructuredTool(
         name=f"mcp__{safe}",
         description=(
             f"Call this tool to access {svc_desc}. "
@@ -410,6 +439,8 @@ def _create_auth_placeholder_tool(
         coroutine=_require_auth,
         args_schema=_Input,
     )
+    tool.metadata = {"is_auth_placeholder": True}
+    return tool
 
 
 async def _connect_single_server(
@@ -489,9 +520,11 @@ async def _connect_single_server(
             logger.error(f"[{name}] timeout after {timeout}s ({config.get('url')})")
         except Exception as exc:
             if _is_needs_authorization(exc):
-                logger.info(
-                    "[%s] MCP OAuth required — returning auth placeholder tool",
+                logger.warning(
+                    "[%s] MCP OAuth required — returning auth placeholder tool (%s: %s)",
                     name,
+                    type(exc).__name__,
+                    exc,
                 )
                 return prepare_tools_for_model(
                     [_create_auth_placeholder_tool(auth_key, server_cfg)],
@@ -500,10 +533,52 @@ async def _connect_single_server(
             elif _is_auth_error(exc):
                 auth_mode = server_cfg.get("auth_mode", "sso")
                 if auth_mode in ("oauth", "dcr"):
-                    logger.info(
-                        "[%s] MCP tool discovery auth failed — returning auth placeholder tool",
-                        name,
-                    )
+                    user_id = _current_user_id.get()
+                    token_was_sent = False
+                    if user_id:
+                        from deep_agent.aegra.mcp_token_store import McpTokenStore
+
+                        try:
+                            store = McpTokenStore(settings.database_uri)
+                            stored = await store.get_token(
+                                settings.agent_deployment_id, user_id, name
+                            )
+                            token_was_sent = stored is not None
+                        except Exception:
+                            logger.debug(
+                                "[%s] failed to check token store for user=%s",
+                                name,
+                                user_id,
+                                exc_info=True,
+                            )
+                    if token_was_sent:
+                        from deep_agent.aegra.mcp_tool_auth import _track_auth_failure
+
+                        escalate = _track_auth_failure(user_id or "_", name)
+                        log = logger.error if escalate else logger.warning
+                        log(
+                            "[%s] MCP server REJECTED stored OAuth token (auth_mode=%s, user=%s) "
+                            "— token exists in Redis but server-side session may be expired. "
+                            "User may need to re-authenticate directly with the MCP provider. "
+                            "(%s: %s)%s",
+                            name,
+                            auth_mode,
+                            user_id,
+                            type(exc).__name__,
+                            exc,
+                            " [REPEATED — exceeds threshold, possible systemic issue]"
+                            if escalate
+                            else "",
+                        )
+                    else:
+                        logger.warning(
+                            "[%s] MCP tool discovery auth failed (auth_mode=%s) "
+                            "— returning auth placeholder tool (%s: %s)",
+                            name,
+                            auth_mode,
+                            type(exc).__name__,
+                            exc,
+                        )
                     return prepare_tools_for_model(
                         [_create_auth_placeholder_tool(auth_key, server_cfg)],
                         auth_key,
@@ -688,7 +763,7 @@ async def get_mcp_tools(
             bearer = await _resolve_connection_token(name, entry, sso_token, user_id)
             auth_mode = entry.get("auth_mode", "sso")
             if auth_mode in ("oauth", "dcr") and bearer is None:
-                logger.info(
+                logger.warning(
                     "[%s] No OAuth token for %s server — using auth placeholder",
                     mcp_prefix_name,
                     auth_mode,
@@ -745,9 +820,16 @@ async def get_mcp_tools(
     if cache_key is not None:
         _cached_tools[cache_key] = tools
         _cached_tools_ts[cache_key] = time.time()
+    placeholder_count = sum(
+        1 for t in tools if getattr(t, "metadata", {}).get("is_auth_placeholder")
+    )
+    placeholder_tag = (
+        f" [AUTH PLACEHOLDER x{placeholder_count}]" if placeholder_count else ""
+    )
     logger.warning(
-        "Loaded %d MCP tool(s): %s (cached for %.0fs, user=%s)",
+        "Loaded %d MCP tool(s)%s: %s (cached for %.0fs, user=%s)",
         len(tools),
+        placeholder_tag,
         ", ".join(seen),
         _MCP_TOOL_CACHE_TTL,
         cache_key or "anonymous",

@@ -78,21 +78,41 @@ async def _resolve_bearer(
     try:
         bearer = await _resolve_connection_token(mcp_name, entry, sso_token, user_id)
     except NeedsAuthorization:
+        logger.warning(
+            "[%s] NeedsAuthorization during host bearer resolution for user=%s",
+            mcp_name,
+            user_id,
+        )
         raise _authorization_required(mcp_name) from None
 
     if not auth_required:
         return bearer
 
     if auth_mode in ("oauth", "dcr") and not bearer:
+        logger.warning(
+            "[%s] no %s bearer token for user=%s in host proxy — authorization required",
+            mcp_name,
+            auth_mode,
+            user_id,
+        )
         raise _authorization_required(mcp_name)
 
     if auth_mode == "sso" and not bearer:
+        logger.warning(
+            "[%s] missing SSO bearer token for user=%s in host proxy",
+            mcp_name,
+            user_id,
+        )
         raise HTTPException(
             status_code=401,
             detail="Missing Authorization bearer token for SSO MCP access",
         )
 
     if auth_mode == "api_key" and not bearer:
+        logger.warning(
+            "[%s] api_key not configured on agent — host proxy blocked",
+            mcp_name,
+        )
         raise HTTPException(
             status_code=500,
             detail=f"MCP '{mcp_name}' api_key is not configured on the agent",
@@ -117,9 +137,24 @@ async def mcp_session(
     config = _build_server_config(entry, bearer)
     client = MultiServerMCPClient({mcp_name: config})
     timeout = float(entry.get("timeout", 30))
-    async with asyncio.timeout(timeout):
-        async with client.session(mcp_name) as session:
-            yield session
+    try:
+        async with asyncio.timeout(timeout):
+            async with client.session(mcp_name) as session:
+                yield session
+    except TimeoutError:
+        logger.error(
+            "[%s] host proxy MCP session timed out after %.0fs",
+            mcp_name,
+            timeout,
+        )
+        raise
+    except Exception:
+        logger.error(
+            "[%s] host proxy MCP session failed",
+            mcp_name,
+            exc_info=True,
+        )
+        raise
 
 
 async def _find_mcp_tool(session: Any, tool_name: str) -> Any | None:

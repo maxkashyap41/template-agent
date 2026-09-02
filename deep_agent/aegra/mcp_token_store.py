@@ -253,10 +253,16 @@ class McpTokenStore:
         self, agent_name: str, user_id: str, mcp_name: str
     ) -> McpOAuthToken | None:
         """Return stored OAuth tokens for *(agent_name, user_id, mcp_name)* from Redis."""
-        raw = await asyncio.to_thread(
-            cache_get, self._token_key(agent_name, user_id, mcp_name)
-        )
+        key = self._token_key(agent_name, user_id, mcp_name)
+        raw = await asyncio.to_thread(cache_get, key)
         if raw is None:
+            logger.warning(
+                "No MCP OAuth token in Redis for agent='%s' user='%s' mcp='%s' (key=%s)",
+                agent_name,
+                user_id,
+                mcp_name,
+                key,
+            )
             return None
         try:
             payload = json.loads(raw)
@@ -295,9 +301,26 @@ class McpTokenStore:
         key = self._token_key(agent_name, user_id, mcp_name)
         stored = await asyncio.to_thread(cache_set_persistent, key, json.dumps(payload))
         if not stored:
+            logger.error(
+                "Redis SET failed for MCP OAuth token: agent='%s' user='%s' mcp='%s' key=%s",
+                agent_name,
+                user_id,
+                mcp_name,
+                key,
+            )
             raise RuntimeError(
                 f"Failed to persist MCP OAuth token for agent '{agent_name}' user '{user_id}' MCP '{mcp_name}'"
             )
+        logger.warning(
+            "MCP OAuth token stored: agent='%s' user='%s' mcp='%s' "
+            "has_refresh=%s expires_at=%s scopes=%s",
+            agent_name,
+            user_id,
+            mcp_name,
+            bool(refresh_token),
+            expires_at,
+            scopes,
+        )
         return McpOAuthToken(
             agent_name=agent_name,
             user_id=user_id,
@@ -311,9 +334,17 @@ class McpTokenStore:
 
     async def delete_token(self, agent_name: str, user_id: str, mcp_name: str) -> bool:
         """Delete stored OAuth tokens for *(agent_name, user_id, mcp_name)* from Redis."""
-        return await asyncio.to_thread(
-            cache_delete, self._token_key(agent_name, user_id, mcp_name)
+        key = self._token_key(agent_name, user_id, mcp_name)
+        result = await asyncio.to_thread(cache_delete, key)
+        logger.warning(
+            "MCP OAuth token deleted: agent='%s' user='%s' mcp='%s' key=%s success=%s",
+            agent_name,
+            user_id,
+            mcp_name,
+            key,
+            result,
         )
+        return result
 
     @staticmethod
     def expires_at_from_token_response(data: dict[str, Any]) -> datetime | None:
