@@ -342,7 +342,9 @@ async def handle_mcp_oauth_callback(
 
         invalidate_graph_cache()
     except Exception:
-        logger.debug("Graph cache invalidation skipped", exc_info=True)
+        logger.warning(
+            "Graph cache invalidation failed in OAuth callback", exc_info=True
+        )
 
     opener_origin = caller_origin or settings.ui_origin
     return HTMLResponse(_callback_html(mcp_name=mcp_name, opener_origin=opener_origin))

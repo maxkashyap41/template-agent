@@ -38,6 +38,11 @@ def _fix_stringified_json_args(tool: Any, kwargs: dict[str, Any]) -> dict[str, A
     try:
         schema_props = getattr(tool, "args", {}) or {}
     except Exception:
+        logger.debug(
+            "Failed to read args schema for tool '%s' — skipping JSON arg fix",
+            getattr(tool, "name", "?"),
+            exc_info=True,
+        )
         return kwargs
 
     if not schema_props:
@@ -128,15 +133,20 @@ def _wrap_single_tool(tool: Any) -> Any:
                     kwargs = _fix_stringified_json_args(tool, kwargs)
                     return await coroutine(**kwargs)
                 except NeedsAuthorization as exc:
-                    logger.info(
-                        "MCP auth required for '%s' — interrupting run",
+                    logger.warning(
+                        "[%s] MCP auth required — interrupting run (tool=%s)",
                         exc.mcp_name,
+                        getattr(tool, "name", "?"),
                     )
                     interrupt(_mcp_auth_interrupt_payload(exc))
 
         try:
             wrapped = tool.model_copy(update={"coroutine": wrapped_coroutine})
         except Exception:
+            logger.info(
+                "model_copy failed for tool '%s' — patching coroutine directly",
+                getattr(tool, "name", "?"),
+            )
             tool.coroutine = wrapped_coroutine
             wrapped = tool
         object.__setattr__(wrapped, "ainvoke", _make_safe_ainvoke(wrapped))
@@ -150,11 +160,20 @@ def _wrap_single_tool(tool: Any) -> Any:
                     kwargs = _fix_stringified_json_args(tool, kwargs)
                     return func(**kwargs)
                 except NeedsAuthorization as exc:
+                    logger.warning(
+                        "[%s] MCP auth required — interrupting run (tool=%s)",
+                        exc.mcp_name,
+                        getattr(tool, "name", "?"),
+                    )
                     interrupt(_mcp_auth_interrupt_payload(exc))
 
         try:
             wrapped = tool.model_copy(update={"func": wrapped_func})
         except Exception:
+            logger.info(
+                "model_copy failed for tool '%s' — patching func directly",
+                getattr(tool, "name", "?"),
+            )
             tool.func = wrapped_func
             wrapped = tool
         object.__setattr__(wrapped, "ainvoke", _make_safe_ainvoke(wrapped))

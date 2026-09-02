@@ -245,12 +245,21 @@ class McpCredentialResolver:
         current_agent_name = settings.agent_deployment_id
         stored = await self._store.get_token(current_agent_name, user_id, mcp_name)
         if stored is None:
+            logger.info(
+                "[%s] no stored OAuth token for agent=%s — authorization required",
+                mcp_name,
+                current_agent_name,
+            )
             raise NeedsAuthorization(mcp_name, self.connect_url(mcp_name))
 
         if self._token_valid(stored):
             return stored.access_token
 
         if not stored.refresh_token:
+            logger.info(
+                "[%s] OAuth token expired and no refresh_token — authorization required",
+                mcp_name,
+            )
             raise NeedsAuthorization(mcp_name, self.connect_url(mcp_name))
 
         lock_name = f"mcp_token_refresh:{current_agent_name}:{user_id}:{mcp_name}"
@@ -261,10 +270,18 @@ class McpCredentialResolver:
         ) as lock_state:
             stored = await self._store.get_token(current_agent_name, user_id, mcp_name)
             if stored is None:
+                logger.info(
+                    "[%s] token vanished during lock — authorization required",
+                    mcp_name,
+                )
                 raise NeedsAuthorization(mcp_name, self.connect_url(mcp_name))
             if self._token_valid(stored):
                 return stored.access_token
             if not stored.refresh_token:
+                logger.info(
+                    "[%s] token expired, no refresh_token after lock — authorization required",
+                    mcp_name,
+                )
                 raise NeedsAuthorization(mcp_name, self.connect_url(mcp_name))
 
             if lock_state == "timeout":
@@ -273,6 +290,10 @@ class McpCredentialResolver:
                 )
                 if refreshed_by_peer:
                     return refreshed_by_peer
+                logger.info(
+                    "[%s] peer refresh timed out — authorization required",
+                    mcp_name,
+                )
                 raise NeedsAuthorization(mcp_name, self.connect_url(mcp_name))
 
             if lock_state == "no_redis":
@@ -286,6 +307,10 @@ class McpCredentialResolver:
                 self.invalidate_cache(user_id, mcp_name)
                 return refreshed
 
+        logger.info(
+            "[%s] OAuth token refresh exhausted — authorization required",
+            mcp_name,
+        )
         raise NeedsAuthorization(mcp_name, self.connect_url(mcp_name))
 
     async def _wait_for_refreshed_token(
@@ -392,7 +417,11 @@ class McpCredentialResolver:
             expires_at=expires_at,
             scopes=scopes,
         )
-        logger.info("Refreshed MCP OAuth token for '%s'", stored.mcp_name)
+        logger.info(
+            "Refreshed MCP OAuth token for '%s' (new expires_at=%s)",
+            stored.mcp_name,
+            expires_at,
+        )
         return new_access
 
     async def _resolve_client_credentials(

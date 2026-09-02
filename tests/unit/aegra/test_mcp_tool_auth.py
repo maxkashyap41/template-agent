@@ -8,7 +8,11 @@ import pytest
 from langchain_core.messages import ToolMessage
 
 from deep_agent.aegra.mcp_auth import NeedsAuthorization
-from deep_agent.aegra.mcp_tool_auth import _wrap_single_tool, wrap_mcp_tools_for_auth
+from deep_agent.aegra.mcp_tool_auth import (
+    _fix_stringified_json_args,
+    _wrap_single_tool,
+    wrap_mcp_tools_for_auth,
+)
 
 
 def _make_mock_tool(*, name: str = "gitlab_list_issues", coroutine=None):
@@ -123,6 +127,102 @@ class TestSafeAinvoke:
 
         with pytest.raises(GraphInterrupt):
             await wrapped.ainvoke({"id": "call_5"})
+
+
+class TestWrappedCoroutineNeedsAuth:
+    """Test that NeedsAuthorization in a wrapped coroutine triggers an interrupt."""
+
+    @pytest.mark.asyncio
+    async def test_needs_authorization_triggers_interrupt_async(self):
+        from unittest.mock import patch as _patch
+
+        from deep_agent.aegra.mcp_auth import NeedsAuthorization
+
+        exc = NeedsAuthorization("gitlab-mcp", "/mcp/gitlab-mcp/connect")
+
+        async def failing_coroutine(**kwargs):
+            raise exc
+
+        tool = _make_mock_tool(coroutine=failing_coroutine)
+        tool.func = None
+        # Force model_copy to fail so wrapped == tool (coroutine patched in place)
+        tool.model_copy = MagicMock(side_effect=TypeError("no model_copy"))
+
+        wrapped = _wrap_single_tool(tool)
+
+        sentinel = RuntimeError("interrupt-called")
+        with _patch("deep_agent.aegra.mcp_tool_auth.interrupt", side_effect=sentinel):
+            with pytest.raises(RuntimeError, match="interrupt-called"):
+                await wrapped.coroutine(query="test")
+
+    @pytest.mark.asyncio
+    async def test_needs_authorization_triggers_interrupt_sync(self):
+        from unittest.mock import patch as _patch
+
+        from deep_agent.aegra.mcp_auth import NeedsAuthorization
+
+        exc = NeedsAuthorization("gitlab-mcp", "/mcp/gitlab-mcp/connect")
+
+        def failing_func(**kwargs):
+            raise exc
+
+        tool = _make_mock_tool()
+        tool.coroutine = None
+        tool.func = failing_func
+        # Force model_copy to fail so wrapped == tool (func patched in place)
+        tool.model_copy = MagicMock(side_effect=TypeError("no model_copy"))
+
+        wrapped = _wrap_single_tool(tool)
+
+        sentinel = RuntimeError("interrupt-called")
+        with _patch("deep_agent.aegra.mcp_tool_auth.interrupt", side_effect=sentinel):
+            with pytest.raises(RuntimeError, match="interrupt-called"):
+                wrapped.func(query="test")
+
+    @pytest.mark.asyncio
+    async def test_model_copy_fallback_patches_coroutine_directly(self):
+        """When model_copy fails, the tool is patched directly."""
+
+        async def ok_coroutine(**kwargs):
+            return "result"
+
+        tool = _make_mock_tool(coroutine=ok_coroutine)
+        tool.func = None
+        # Make model_copy raise so the fallback path is taken
+        tool.model_copy = MagicMock(side_effect=TypeError("no model_copy"))
+
+        wrapped = _wrap_single_tool(tool)
+        assert wrapped is tool  # same object, patched in place
+        assert wrapped.coroutine is not ok_coroutine  # replaced
+
+    def test_model_copy_fallback_patches_func_directly(self):
+        """When model_copy fails for a sync tool, func is patched directly."""
+
+        def ok_func(**kwargs):
+            return "result"
+
+        tool = _make_mock_tool()
+        tool.coroutine = None
+        tool.func = ok_func
+        tool.model_copy = MagicMock(side_effect=TypeError("no model_copy"))
+
+        wrapped = _wrap_single_tool(tool)
+        assert wrapped is tool  # same object, patched in place
+        assert wrapped.func is not ok_func  # replaced
+
+
+class TestFixStringifiedJsonArgs:
+    """Test _fix_stringified_json_args edge cases."""
+
+    def test_returns_kwargs_when_args_property_raises(self):
+        """When getattr(tool, 'args') raises, kwargs are returned unchanged."""
+        tool = MagicMock()
+        type(tool).args = property(
+            lambda self: (_ for _ in ()).throw(RuntimeError("boom"))
+        )
+        kwargs = {"query": "test"}
+        result = _fix_stringified_json_args(tool, kwargs)
+        assert result == kwargs
 
 
 class TestWrapMcpToolsForAuth:

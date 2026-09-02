@@ -1299,6 +1299,120 @@ class TestResolveBearer:
             )
         assert exc.value.status_code == 500
 
+    @pytest.mark.asyncio
+    async def test_oauth_dcr_missing_bearer_raises_401(self):
+        with (
+            patch(
+                "deep_agent.aegra.mcp_host._resolve_connection_token",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "deep_agent.aegra.mcp_auth.get_mcp_credential_resolver",
+            ) as mock_resolver,
+            pytest.raises(HTTPException) as exc,
+        ):
+            mock_resolver.return_value.connect_url.return_value = "/mcp/dcr-mcp/connect"
+            await _resolve_bearer(
+                "dcr-mcp",
+                _server_cfg(auth=True, auth_mode="dcr"),
+                user_id="u1",
+                sso_token=None,
+            )
+        assert exc.value.status_code == 401
+        assert exc.value.detail["error"] == "authorization_required"
+        assert exc.value.detail["connect_url"] == "/mcp/dcr-mcp/connect"
+
+
+class TestMcpSession:
+    @pytest.mark.asyncio
+    async def test_session_timeout_raises_and_logs(self, caplog):
+        """mcp_session logs an error on TimeoutError."""
+        import logging
+
+        from deep_agent.aegra.mcp_host import mcp_session
+
+        with (
+            patch(
+                "deep_agent.aegra.mcp_host._get_server_configs",
+                return_value={"slow-mcp": _server_cfg(timeout=0.01)},
+            ),
+            patch(
+                "deep_agent.aegra.mcp_host._resolve_bearer",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "deep_agent.aegra.mcp_host.MultiServerMCPClient",
+            ) as mock_client_cls,
+            caplog.at_level(logging.ERROR),
+        ):
+
+            @asynccontextmanager
+            async def _hanging_session(_name):
+                import asyncio
+
+                await asyncio.sleep(10)
+                yield MagicMock()  # pragma: no cover
+
+            client = MagicMock()
+            client.session = _hanging_session
+            mock_client_cls.return_value = client
+
+            with pytest.raises(TimeoutError):
+                async with mcp_session("slow-mcp", user_id="u1", sso_token=None):
+                    pass  # pragma: no cover
+
+        error_records = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.ERROR and "timed out" in r.message
+        ]
+        assert len(error_records) == 1
+
+    @pytest.mark.asyncio
+    async def test_session_generic_error_raises_and_logs(self, caplog):
+        """mcp_session logs an error on generic Exception."""
+        import logging
+
+        from deep_agent.aegra.mcp_host import mcp_session
+
+        with (
+            patch(
+                "deep_agent.aegra.mcp_host._get_server_configs",
+                return_value={"bad-mcp": _server_cfg()},
+            ),
+            patch(
+                "deep_agent.aegra.mcp_host._resolve_bearer",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "deep_agent.aegra.mcp_host.MultiServerMCPClient",
+            ) as mock_client_cls,
+            caplog.at_level(logging.ERROR),
+        ):
+
+            @asynccontextmanager
+            async def _failing_session(_name):
+                raise ConnectionError("transport failed")
+                yield  # pragma: no cover
+
+            client = MagicMock()
+            client.session = _failing_session
+            mock_client_cls.return_value = client
+
+            with pytest.raises(ConnectionError, match="transport failed"):
+                async with mcp_session("bad-mcp", user_id="u1", sso_token=None):
+                    pass  # pragma: no cover
+
+        error_records = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.ERROR and "session failed" in r.message
+        ]
+        assert len(error_records) == 1
+
 
 class TestListToolsAndFindTool:
     @pytest.mark.asyncio

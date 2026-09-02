@@ -254,6 +254,30 @@ class TestMcpCredentialResolver:
         assert token == "new-access"
         refresh.assert_awaited_once()
 
+    async def test_oauth_raises_when_expired_and_no_refresh_token(self):
+        """Expired token with no refresh_token triggers NeedsAuthorization."""
+        store = AsyncMock()
+        store.get_token = AsyncMock(
+            return_value=McpOAuthToken(
+                agent_name="test-agent",
+                user_id="user-1",
+                mcp_name="oauth-mcp",
+                access_token="expired-access",
+                refresh_token=None,
+                expires_at=datetime.now(UTC) - timedelta(minutes=5),
+            )
+        )
+        resolver = McpCredentialResolver(token_store=store)
+
+        with pytest.raises(NeedsAuthorization) as exc:
+            await resolver.resolve(
+                "user-1",
+                "oauth-mcp",
+                {"auth_mode": "oauth", "oauth": {}},
+            )
+        assert exc.value.mcp_name == "oauth-mcp"
+        store.get_token.assert_awaited_once()
+
     async def test_resolver_caches_resolved_oauth_token(self):
         store = AsyncMock()
         store.get_token = AsyncMock(
@@ -272,6 +296,199 @@ class TestMcpCredentialResolver:
         await resolver.resolve("user-1", "oauth-mcp", cfg)
 
         store.get_token.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+class TestOAuthLockEdgeCases:
+    """Tests for distributed lock edge cases in _resolve_oauth."""
+
+    @staticmethod
+    def _expired_token(*, refresh_token="refresh-me"):
+        return McpOAuthToken(
+            agent_name="test-agent",
+            user_id="user-1",
+            mcp_name="oauth-mcp",
+            access_token="expired-access",
+            refresh_token=refresh_token,
+            expires_at=datetime.now(UTC) - timedelta(minutes=5),
+        )
+
+    async def test_token_vanished_during_lock(self):
+        """When token disappears after acquiring the lock, NeedsAuthorization is raised."""
+        from contextlib import asynccontextmanager
+
+        store = AsyncMock()
+        # First call returns expired token, second call (inside lock) returns None
+        store.get_token = AsyncMock(side_effect=[self._expired_token(), None])
+        resolver = McpCredentialResolver(token_store=store)
+
+        @asynccontextmanager
+        async def _mock_lock(*a, **kw):
+            yield "held"
+
+        with patch("deep_agent.aegra.mcp_auth.distributed_lock", _mock_lock):
+            with pytest.raises(NeedsAuthorization) as exc:
+                await resolver.resolve(
+                    "user-1", "oauth-mcp", {"auth_mode": "oauth", "oauth": {}}
+                )
+            assert exc.value.mcp_name == "oauth-mcp"
+
+    async def test_no_refresh_token_after_lock(self):
+        """When refresh_token vanishes after lock, NeedsAuthorization is raised."""
+        from contextlib import asynccontextmanager
+
+        no_refresh = McpOAuthToken(
+            agent_name="test-agent",
+            user_id="user-1",
+            mcp_name="oauth-mcp",
+            access_token="expired-access",
+            refresh_token=None,
+            expires_at=datetime.now(UTC) - timedelta(minutes=5),
+        )
+
+        store = AsyncMock()
+        store.get_token = AsyncMock(side_effect=[self._expired_token(), no_refresh])
+        resolver = McpCredentialResolver(token_store=store)
+
+        @asynccontextmanager
+        async def _mock_lock(*a, **kw):
+            yield "held"
+
+        with patch("deep_agent.aegra.mcp_auth.distributed_lock", _mock_lock):
+            with pytest.raises(NeedsAuthorization):
+                await resolver.resolve(
+                    "user-1", "oauth-mcp", {"auth_mode": "oauth", "oauth": {}}
+                )
+
+    async def test_peer_refresh_timed_out(self):
+        """When lock times out and peer didn't refresh, NeedsAuthorization is raised."""
+        from contextlib import asynccontextmanager
+
+        store = AsyncMock()
+        store.get_token = AsyncMock(
+            side_effect=[self._expired_token(), self._expired_token()]
+        )
+        resolver = McpCredentialResolver(token_store=store)
+
+        @asynccontextmanager
+        async def _mock_lock(*a, **kw):
+            yield "timeout"
+
+        with (
+            patch("deep_agent.aegra.mcp_auth.distributed_lock", _mock_lock),
+            patch.object(
+                resolver,
+                "_wait_for_refreshed_token",
+                new=AsyncMock(return_value=None),
+            ),
+        ):
+            with pytest.raises(NeedsAuthorization):
+                await resolver.resolve(
+                    "user-1", "oauth-mcp", {"auth_mode": "oauth", "oauth": {}}
+                )
+
+    async def test_refresh_exhausted_raises(self):
+        """When _refresh_mcp_token returns None, NeedsAuthorization is raised."""
+        from contextlib import asynccontextmanager
+
+        store = AsyncMock()
+        store.get_token = AsyncMock(
+            side_effect=[self._expired_token(), self._expired_token()]
+        )
+        resolver = McpCredentialResolver(token_store=store)
+
+        @asynccontextmanager
+        async def _mock_lock(*a, **kw):
+            yield "held"
+
+        with (
+            patch("deep_agent.aegra.mcp_auth.distributed_lock", _mock_lock),
+            patch.object(
+                resolver,
+                "_refresh_mcp_token",
+                new=AsyncMock(return_value=None),
+            ),
+        ):
+            with pytest.raises(NeedsAuthorization):
+                await resolver.resolve(
+                    "user-1", "oauth-mcp", {"auth_mode": "oauth", "oauth": {}}
+                )
+
+    async def test_refresh_success_logs_and_returns(self):
+        """Successful token refresh returns new access token."""
+        from contextlib import asynccontextmanager
+
+        store = AsyncMock()
+        store.get_token = AsyncMock(
+            side_effect=[self._expired_token(), self._expired_token()]
+        )
+        store.upsert_token = AsyncMock()
+        resolver = McpCredentialResolver(token_store=store)
+
+        @asynccontextmanager
+        async def _mock_lock(*a, **kw):
+            yield "held"
+
+        with (
+            patch("deep_agent.aegra.mcp_auth.distributed_lock", _mock_lock),
+            patch.object(
+                resolver,
+                "_refresh_mcp_token",
+                new=AsyncMock(return_value="new-access-token"),
+            ),
+        ):
+            token = await resolver.resolve(
+                "user-1", "oauth-mcp", {"auth_mode": "oauth", "oauth": {}}
+            )
+            assert token == "new-access-token"
+
+
+@pytest.mark.asyncio
+class TestRefreshMcpToken:
+    """Tests for _refresh_mcp_token success path."""
+
+    async def test_successful_refresh_returns_new_access_token(self):
+        store = AsyncMock()
+        store.upsert_token = AsyncMock()
+        resolver = McpCredentialResolver(token_store=store)
+
+        stored = McpOAuthToken(
+            agent_name="test-agent",
+            user_id="user-1",
+            mcp_name="oauth-mcp",
+            access_token="expired-access",
+            refresh_token="refresh-me",
+            expires_at=datetime.now(UTC) - timedelta(minutes=5),
+        )
+
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "access_token": "new-access-token",
+            "expires_in": 3600,
+            "token_type": "Bearer",
+        }
+        mock_response.raise_for_status = MagicMock()
+
+        mock_ctx = AsyncMock()
+        mock_ctx.post = AsyncMock(return_value=mock_response)
+
+        server_cfg = {
+            "auth_mode": "oauth",
+            "oauth": {
+                "token_endpoint": "https://auth.example.com/token",
+                "client_id": "cid",
+                "client_secret": "csecret",
+            },
+        }
+
+        with patch("deep_agent.aegra.mcp_auth.httpx.AsyncClient") as mock_client_cls:
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_ctx)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            result = await resolver._refresh_mcp_token(stored, server_cfg)
+
+        assert result == "new-access-token"
+        store.upsert_token.assert_awaited_once()
 
 
 @pytest.mark.asyncio

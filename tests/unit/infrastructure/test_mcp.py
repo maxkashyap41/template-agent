@@ -854,3 +854,40 @@ class TestCreateAuthPlaceholderTool:
             with pytest.raises(NeedsAuthorization) as exc_info:
                 await tool.coroutine(query="list my tickets")
         assert exc_info.value.connect_url == "http://localhost/mcp/jira-mcp/connect"
+
+    @pytest.mark.asyncio
+    async def test_require_auth_logs_warning_on_non_auth_exception(self, caplog):
+        """Non-NeedsAuth exceptions during resolve fall through to NeedsAuthorization."""
+        import logging
+
+        from deep_agent.aegra.mcp_auth import NeedsAuthorization
+
+        tool = _create_auth_placeholder_tool(
+            "jira-mcp", {"description": "JIRA services"}
+        )
+        mock_resolver = MagicMock()
+        mock_resolver.resolve = AsyncMock(side_effect=ConnectionError("network down"))
+        mock_resolver.connect_url.return_value = "http://localhost/mcp/jira-mcp/connect"
+        with (
+            caplog.at_level(logging.WARNING),
+            patch("deep_agent.aegra.mcp._current_user_id") as mock_ctx,
+            patch(
+                "deep_agent.aegra.mcp._get_server_configs",
+                return_value={"jira-mcp": {"auth_mode": "dcr"}},
+            ),
+            patch(
+                "deep_agent.aegra.mcp_auth.get_mcp_credential_resolver",
+                return_value=mock_resolver,
+            ),
+        ):
+            mock_ctx.get.return_value = "user-1"
+            with pytest.raises(NeedsAuthorization):
+                await tool.coroutine(query="list my tickets")
+
+        warning_records = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.WARNING
+            and "placeholder tool auth resolve failed" in r.message
+        ]
+        assert len(warning_records) == 1
