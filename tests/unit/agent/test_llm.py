@@ -199,12 +199,12 @@ class TestCreateModel:
             mock_chat.assert_called_once()
             assert mock_chat.call_args[1]["location"] == "us-central1"
 
-    def test_create_claude_model_falls_back_to_google_cloud_location(self):
-        """GOOGLE_CLOUD_LOCATION is used when CLAUDE_LOCATION is unset."""
+    def test_create_claude_model_ignores_google_cloud_location(self):
+        """Claude falls back to us-east5, NOT GOOGLE_CLOUD_LOCATION (region-restricted)."""
         mock_creds = MagicMock()
         mock_settings = MagicMock()
         mock_settings.CLAUDE_LOCATION = None
-        mock_settings.GOOGLE_CLOUD_LOCATION = "europe-west1"
+        mock_settings.GOOGLE_CLOUD_LOCATION = "global"
 
         with (
             patch(
@@ -216,7 +216,7 @@ class TestCreateModel:
             mock_get_creds.return_value = (mock_creds, "test-project")
             create_model("claude-sonnet-4", temperature=0.7)
             mock_chat.assert_called_once()
-            assert mock_chat.call_args[1]["location"] == "europe-west1"
+            assert mock_chat.call_args[1]["location"] == "us-east5"
 
     def test_vertex_value_error_re_raised_directly(self):
         """ValueError from Vertex model constructors propagates without wrapping."""
